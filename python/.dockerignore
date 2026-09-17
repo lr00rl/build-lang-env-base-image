@@ -1,0 +1,3 @@
+# Only the hashed lock enters the image. Edit base.in on the host, then `make lock`.
+*
+!base.lock
