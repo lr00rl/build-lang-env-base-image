@@ -1,0 +1,3 @@
+# No build-context files. The Dockerfile only FROM's official node and RUN's adduser.
+# npm ci / COPY package.json belong in the *service* Dockerfile, not here.
+*

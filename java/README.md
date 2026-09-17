@@ -24,6 +24,15 @@ make java-smoke
 make java-push REGISTRY=ghcr.io/your-org VERSION=2026.09.1
 ```
 
+Three local tags (arm-only, amd-only, dual-arch index):
+
+```bash
+make java-build-local-arm64   # java-base:local-arm64
+make java-build-local-amd64   # java-base:local-amd64
+make java-build-local-multi   # java-base:local-multi  (linux/amd64 + linux/arm64)
+make java-smoke-arm64 java-smoke-amd64 java-smoke-multi
+```
+
 From this directory: `make build-local && make smoke`.
 
 `--load` needs a docker-driver builder (Colima: `colima`, Docker Desktop: `desktop-linux`). Multi-arch `--push` uses the `multiarch` docker-container builder (`make java-builder` creates it).

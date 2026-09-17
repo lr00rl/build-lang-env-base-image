@@ -6,8 +6,9 @@ Shared **language runtime** images, one directory per language. Each image is a 
 | --- | --- | --- | --- |
 | [`python/`](python/README.md) | `python-base:local` | `python:3.12-slim-trixie` | CPython 3.12, `uv`, hashed FastAPI / SQLAlchemy / aiomysql stack |
 | [`java/`](java/README.md) | `java-base:local` | `eclipse-temurin:17-jdk-jammy` | Temurin 17 JDK on Ubuntu 22.04 |
+| [`node/`](node/README.md) | `node-base:18-alpine` / `20-alpine` / `22-alpine` | official `node:<N>-alpine` | Node 18, 20, and 22 on Alpine, uid 10001 |
 
-There is no default registry. `make python-push` / `make java-push` require `REGISTRY=...` so a clone cannot push to someone else's repo.
+There is no default registry. `make python-push` / `make java-push` / `make node-push` require `REGISTRY=...` so a clone cannot push to someone else's repo.
 
 ## Make targets
 
@@ -17,13 +18,18 @@ From this directory:
 make help
 
 make python-lock python-audit python-build-local python-smoke
+make python-build-local-arm64 python-build-local-amd64 python-build-local-multi
 make python-push REGISTRY=ghcr.io/your-org VERSION=2026.09.1
 
 make java-build-local java-smoke
+make java-build-local-arm64 java-build-local-amd64 java-build-local-multi
 make java-push REGISTRY=ghcr.io/your-org VERSION=2026.09.1
+
+make node-build-versions node-smoke-versions
+make node-push REGISTRY=ghcr.io/your-org VERSION=2026.09.1 NODE=20
 ```
 
-`make python-<target>` is `make -C python <target>`. Same for `java-`. You can also `cd python` or `cd java` and run the short names (`make build-local`).
+`make python-<target>` is `make -C python <target>`. Same for `java-` and `node-`. You can also `cd python`, `cd java`, or `cd node` and run the short names (`make build-local`).
 
 `--load` (local images) needs a **docker-driver** builder: `docker buildx ls`. Colima names it `colima`; Docker Desktop names it `desktop-linux`. The language Makefiles pick the first docker-driver builder they see. `--push` of two platforms needs a docker-container builder named `multiarch` (`make python-builder` or `make java-builder` creates it once). That builder cannot `--load` a local tag.
 
@@ -31,9 +37,9 @@ Do not retag a single-arch local image and push it as the dual-arch name. amd64 
 
 ## Shared conventions
 
-Both images create a system user `app` with uid/gid **10001**. Default user stays **root** so a child Dockerfile can `chmod` / `mkdir` without flipping `USER`. Child images that want the unprivileged user write `USER app` after those steps.
+Each image creates a system user `app` with uid/gid **10001**. Default user stays **root** so a child Dockerfile can `chmod` / `mkdir` without flipping `USER`. Child images that want the unprivileged user write `USER app` after those steps.
 
-Neither image copies application code, `.env` files, or heap / profile settings. Those belong in the service Dockerfile and in runtime config.
+None of these images copies application code, `.env` files, or heap / profile settings. Those belong in the service Dockerfile and in runtime config.
 
 ## License
 

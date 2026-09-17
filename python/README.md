@@ -53,6 +53,15 @@ make python-build-local
 make python-smoke
 ```
 
+Three local tags (arm-only, amd-only, dual-arch index):
+
+```bash
+make python-build-local-arm64   # python-base:local-arm64
+make python-build-local-amd64   # python-base:local-amd64
+make python-build-local-multi   # python-base:local-multi  (linux/amd64 + linux/arm64)
+make python-smoke-arm64 python-smoke-amd64 python-smoke-multi
+```
+
 From this directory: `make lock && make audit && make build-local && make smoke`.
 
 `--load` needs a docker-driver builder (`docker buildx ls`). Colima names it `colima`; Docker Desktop names it `desktop-linux`. The Makefile picks the first one it sees. The `multiarch` builder is docker-container and is for `--push` only.
