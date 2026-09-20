@@ -1,0 +1,4 @@
+# No build-context files. The Dockerfile only FROM's official rust / debian,
+# apt-get's a few packages and RUN's useradd.
+# COPY Cargo.toml / cargo build belong in the *service* Dockerfile, not here.
+*
