@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1.7
 #
 # Two images out of one file:
-#   --target toolchain -> rust-base     rustc, cargo, clippy, rustfmt, a C toolchain
+#   --target toolchain -> rust-base     rustc, cargo, clippy, rustfmt, a C
+#                                       toolchain for both GNU linux triples,
+#                                       and a cargo-fetched data-query crate graph
 #   --target runtime   -> rust-runtime  Debian slim + ca-certificates, no Rust
 #
 # Why two, when python-base is one:
@@ -28,6 +30,11 @@
 #   trust store. scratch has none, so every HTTPS call to S3 fails at handshake.
 #   Debian slim costs about 30 MB over scratch and keeps a shell for incident
 #   work.
+#
+# Do not put --platform=$BUILDPLATFORM on these FROM lines. Each architecture
+# of rust-base has to carry that architecture's rustc. The BUILDPLATFORM pin
+# belongs on the *service* builder stage, so rustc stays native and only the
+# linker (installed below for both GNU triples) targets the other arch.
 ARG RUST_VERSION=1.98
 ARG DEBIAN_SUITE=trixie
 
@@ -44,32 +51,63 @@ FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS toolchain
 #                            member) fails at the build-script step without it.
 #                            g++ also brings the libstdc++ headers; the runtime
 #                            half already has libstdc++6 to link against.
+#   gcc/g++-*-linux-gnu      both GNU triples, so a --platform=$BUILDPLATFORM
+#                            service build can cross-link without apt-get.
+#   libc6-dev-*-cross        named explicitly because the cross gcc package
+#                            only Recommends it. --no-install-recommends would
+#                            leave it out, and ring's C then fails with
+#                            "bits/libc-header-start.h: No such file or directory".
+#                            glibc 2.41, same as the trixie runtime half.
 #   pkg-config, libssl-dev   -sys crates probing for system libraries
+#   zlib1g-dev               a few build.rs scripts probe for zlib
 #   make, cmake              build scripts of C dependencies
 #   git                      git = "..." dependencies and vendored submodules
+#   lld                      faster linker; cargo-config.toml passes -fuse-ld=lld
+#   python3                  occasional build.rs (not bindgen; clang stays out)
 # Deliberately left out: clang / libclang-dev. Only bindgen users need it
 # (rocksdb, rdkafka), it costs a few hundred MB, and a service builder stage
 # can apt-get it in one line.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       g++ \
+      gcc-x86-64-linux-gnu \
+      gcc-aarch64-linux-gnu \
+      g++-x86-64-linux-gnu \
+      g++-aarch64-linux-gnu \
+      libc6-dev-amd64-cross \
+      libc6-dev-arm64-cross \
       pkg-config \
       libssl-dev \
+      zlib1g-dev \
       make \
       cmake \
       git \
+      lld \
+      python3 \
  && rm -rf /var/lib/apt/lists/*
 
-# So CI can lint and build on the same image instead of pulling a second one.
-RUN rustup component add clippy rustfmt
+# clippy / rustfmt: so CI can lint on the same image.
+# Both GNU linux stds: so a BUILDPLATFORM-pinned service build does not
+# rustup target add at compile time (that download is easy to miss in a
+# "why is Jenkins still compiling" log).
+RUN rustup component add clippy rustfmt \
+ && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 
 # CARGO_INCREMENTAL=0: a container build is one shot and throws the incremental
 # cache away, so producing it only costs disk and link time.
 # The retry counts are for flaky registry DNS inside build agents.
+# CC_*/CXX_*: the cc crate reads these when a build.rs compiles C for the
+# non-host triple. The cargo-config.toml linker= lines cover rustc itself.
 ENV CARGO_TERM_COLOR=always \
     CARGO_INCREMENTAL=0 \
     CARGO_NET_RETRY=10 \
-    RUSTUP_MAX_RETRIES=10
+    RUSTUP_MAX_RETRIES=10 \
+    CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++ \
+    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+
+COPY cargo-config.toml /usr/local/cargo/config.toml
 
 # Same uid as python-base / java-base / node-base. Default user stays root so a
 # child Dockerfile can apt-get and mkdir without an extra USER dance.
@@ -77,8 +115,16 @@ ENV CARGO_TERM_COLOR=always \
 RUN groupadd --system --gid 10001 app \
  && useradd --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app
 
+# Prefetch the shared data-query crate graph into CARGO_HOME/registry. This is
+# fetch only, not a compile: compiling DataFusion here would make the amd64
+# half of a Mac-hosted rust-push run under QEMU for hours. Service Dockerfiles
+# must not cache-mount /usr/local/cargo/registry, or an empty BuildKit cache
+# hides this layer and Jenkins downloads everything again.
+COPY warmup /opt/rust-warmup
+RUN cargo fetch --locked --manifest-path /opt/rust-warmup/Cargo.toml
+
 LABEL org.opencontainers.image.title="rust-base" \
-      org.opencontainers.image.description="Rust toolchain (clippy, rustfmt, cc, pkg-config, cmake) on Debian slim. Build stage only, pair with rust-runtime."
+      org.opencontainers.image.description="Rust toolchain (clippy, rustfmt, both GNU linux targets, cross gcc, lld) plus a cargo-fetched DataFusion/Arrow graph. Build stage only, pair with rust-runtime."
 
 # Smoke / default. Service builder stages override with cargo build.
 CMD ["cargo", "--version"]

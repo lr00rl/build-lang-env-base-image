@@ -1,4 +1,9 @@
-# No build-context files. The Dockerfile only FROM's official rust / debian,
-# apt-get's a few packages and RUN's useradd.
-# COPY Cargo.toml / cargo build belong in the *service* Dockerfile, not here.
+# The image FROMs official rust / debian, apt-get's the toolchain, rustup
+# target add's both GNU triples, and cargo fetch's warmup/. Nothing else
+# from this directory belongs in the context.
 *
+!cargo-config.toml
+!warmup/
+!warmup/**
+warmup/target
+warmup/**/target

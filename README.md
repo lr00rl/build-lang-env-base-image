@@ -7,7 +7,7 @@ Shared **language runtime** images, one directory per language. Each image is a 
 | [`python/`](python/README.md) | `python-base:local` | `python:3.12-slim-trixie` | CPython 3.12, `uv`, hashed FastAPI / SQLAlchemy / aiomysql stack |
 | [`java/`](java/README.md) | `java-base:local` | `eclipse-temurin:17-jdk-jammy` | Temurin 17 JDK on Ubuntu 22.04 |
 | [`node/`](node/README.md) | `node-base:18-alpine` / `20-alpine` / `22-alpine` | official `node:<N>-alpine` | Node 18, 20, and 22 on Alpine, uid 10001 |
-| [`rust/`](rust/README.md) | `rust-base:local` + `rust-runtime:local` | `rust:1.98-slim-trixie` / `debian:trixie-slim` | Rust 1.98 toolchain with clippy, rustfmt and a C toolchain, plus the matching runtime half |
+| [`rust/`](rust/README.md) | `rust-base:local` + `rust-runtime:local` | `rust:1.98-slim-trixie` / `debian:trixie-slim` | Rust 1.98 toolchain with clippy, rustfmt, both GNU-linux targets, cross gcc, lld, and a cargo-fetched DataFusion/Arrow graph, plus the matching runtime half |
 
 Rust is the one language that ships two images. A Rust service compiles against `rust-base` and deploys on `rust-runtime`, which holds no toolchain; see [`rust/README.md`](rust/README.md) for why they have to move together.
 
@@ -31,7 +31,7 @@ make java-push REGISTRY=ghcr.io/your-org VERSION=2026.09.1
 make node-build-versions node-smoke-versions
 make node-push REGISTRY=ghcr.io/your-org VERSION=2026.09.1 NODE=20
 
-make rust-build-local rust-smoke
+make rust-lock rust-build-local rust-smoke
 make rust-build-local-arm64 rust-build-local-amd64 rust-build-local-multi
 make rust-push REGISTRY=ghcr.io/your-org VERSION=2026.09.1
 ```
@@ -48,7 +48,13 @@ Each image creates a system user `app` with uid/gid **10001**. Default user stay
 
 None of these images copies application code, `.env` files, or heap / profile settings. Those belong in the service Dockerfile and in runtime config.
 
-Base images are apt installs, so cross-building them under QEMU is cheap. A compiled-language *service* image is not: building a Rust service for the other architecture through emulation is roughly an order of magnitude slower than native. Build those on a native agent per architecture and join the two tags with `docker buildx imagetools create`.
+Base images are apt installs plus, for rust, a `cargo fetch` of a shared crate
+graph, so cross-building them under QEMU is a few minutes. A compiled-language
+*service* image is not: building a Rust service for the other architecture
+through emulation is roughly an order of magnitude slower than native. Pin the
+service builder to `--platform=$BUILDPLATFORM` and let rust-base's cross gcc
+link the other arch, or build on a native agent per architecture and join the
+two tags with `docker buildx imagetools create`.
 
 ## License
 

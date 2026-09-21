@@ -41,34 +41,38 @@ LOCAL_FLAGS := --provenance=false --sbom=false
 BUILD := docker buildx build --builder $(LOCAL_BUILDER) --load $(LOCAL_FLAGS) $(BUILD_ARGS)
 
 .DEFAULT_GOAL := help
-.PHONY: help build-local build-local-arm64 build-local-amd64 build-local-multi \
+.PHONY: help lock build-local build-local-arm64 build-local-amd64 build-local-multi \
 	smoke smoke-arm64 smoke-amd64 smoke-multi builder push digest require-registry require-builder
 
 help: ## list targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "%-18s %s\n", $$1, $$2}'
 
+lock: warmup/Cargo.lock ## resolve warmup/Cargo.toml -> warmup/Cargo.lock
+warmup/Cargo.lock: warmup/Cargo.toml
+	cd warmup && cargo generate-lockfile
+
 require-builder:
 	@test -n "$(LOCAL_BUILDER)" || { echo "no docker-driver builder found. run: docker buildx ls"; exit 1; }
 
-build-local: require-builder ## native-arch pair -> rust-base:local + rust-runtime:local
+build-local: warmup/Cargo.lock require-builder ## native-arch pair -> rust-base:local + rust-runtime:local
 	$(BUILD) --target toolchain -t $(LOCAL_IMAGE) .
 	$(BUILD) --target runtime   -t $(RT_LOCAL) .
 
-build-local-arm64: require-builder ## arm64-only pair -> :local-arm64
+build-local-arm64: warmup/Cargo.lock require-builder ## arm64-only pair -> :local-arm64
 	$(BUILD) --platform linux/arm64 --target toolchain -t $(NAME):local-arm64 .
 	$(BUILD) --platform linux/arm64 --target runtime   -t $(RT_NAME):local-arm64 .
 
-build-local-amd64: require-builder ## amd64-only pair -> :local-amd64
+build-local-amd64: warmup/Cargo.lock require-builder ## amd64-only pair -> :local-amd64
 	$(BUILD) --platform linux/amd64 --target toolchain -t $(NAME):local-amd64 .
 	$(BUILD) --platform linux/amd64 --target runtime   -t $(RT_NAME):local-amd64 .
 
 # Dual-arch index. Colima's containerd image store can --load both platforms.
-build-local-multi: require-builder ## dual-arch index -> :local-multi
+build-local-multi: warmup/Cargo.lock require-builder ## dual-arch index -> :local-multi
 	$(BUILD) --platform linux/amd64,linux/arm64 --target toolchain -t $(NAME):local-multi .
 	$(BUILD) --platform linux/amd64,linux/arm64 --target runtime   -t $(RT_NAME):local-multi .
 
-smoke: ## print arch, toolchain versions, runtime os, and uid 10001
-	docker run --rm $(LOCAL_IMAGE) sh -c 'uname -m && rustc --version && cargo --version && cargo clippy --version && cargo fmt --version && cc --version | head -1 && g++ --version | head -1 && pkg-config --version && cmake --version | head -1'
+smoke: ## print arch, toolchain, both GNU targets, cross gcc, lld, fetched crates
+	docker run --rm $(LOCAL_IMAGE) sh -c 'set -e; uname -m; rustc --version; cargo --version; cargo clippy --version; cargo fmt --version; rustup target list --installed; x86_64-linux-gnu-gcc --version | head -1; aarch64-linux-gnu-gcc --version | head -1; x86_64-linux-gnu-g++ --version | head -1; aarch64-linux-gnu-g++ --version | head -1; ld.lld --version | head -1; python3 --version; test -f /usr/local/cargo/config.toml; test -d /usr/local/cargo/registry/src; test -f /opt/rust-warmup/Cargo.lock'
 	docker run --rm $(RT_LOCAL) sh -c 'uname -m && . /etc/os-release && echo "$$PRETTY_NAME" && ls -l /etc/ssl/certs/ca-certificates.crt && ldconfig -p | grep -c libgcc_s'
 	docker run --rm --user app $(RT_LOCAL) id
 	docker image ls $(NAME):local
@@ -99,7 +103,7 @@ builder: ## create the multi-arch (docker-container) builder once
 require-registry:
 	@test -n "$(REGISTRY)" || { echo "set REGISTRY, e.g. make push REGISTRY=ghcr.io/your-org"; exit 1; }
 
-push: require-registry builder ## multi-arch build + push of both images (requires REGISTRY)
+push: warmup/Cargo.lock require-registry builder ## multi-arch build + push of both images (requires REGISTRY)
 	docker buildx build --builder $(MULTI_BUILDER) --platform $(PLATFORMS) $(BUILD_ARGS) \
 	  --provenance=mode=max --sbom=true --target toolchain \
 	  -t $(IMAGE):$(TAG) -t $(IMAGE):$(RUST)-$(SUITE) --push .

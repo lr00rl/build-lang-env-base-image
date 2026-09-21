@@ -1,0 +1,20 @@
+# Shared by every service that FROMs rust-base.
+#
+# A service Dockerfile that pins the builder to --platform=$BUILDPLATFORM
+# compiles with the host rustc and only the linker / cc target the other
+# architecture. These two target sections are that wiring, so each service
+# does not have to install gcc-<arch>-linux-gnu or export CARGO_TARGET_*_LINKER.
+#
+# -fuse-ld=lld: a DataFusion-sized rlib graph spends a large share of wall
+# time in the linker. lld is architecture-neutral enough that the same flag
+# works for both GNU targets; gcc finds ld.lld on PATH.
+
+[target.x86_64-unknown-linux-gnu]
+linker = "x86_64-linux-gnu-gcc"
+ar = "x86_64-linux-gnu-ar"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+ar = "aarch64-linux-gnu-ar"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
