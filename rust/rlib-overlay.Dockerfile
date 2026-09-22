@@ -1,12 +1,14 @@
 # syntax=docker/dockerfile:1.7
 #
-# Adds /opt/rust-cache/<gnu-triple> onto an existing rust-base (fetch +
-# toolchain already in the FROM). Cook those trees on the build machine
-# with `make cook-rlibs` so LLVM writes to the host disk, not Colima's
-# 20 GB image store. COPY is files only, so the same blob lands on every
-# TARGETPLATFORM without QEMU cargo.
+# Adds an amd64-host cargo target dir onto an existing rust-base.
+# `release/` is the host build scripts and proc-macros. Each GNU triple
+# dir is the rlibs for that --target. Cook with CARGO_TARGET_DIR=/cache/target
+# on an amd64 host (Rosetta is enough; QEMU is not) so the fingerprints
+# match Jenkins. COPY is files only, so the same blob lands on every
+# TARGETPLATFORM.
 ARG BASE
 FROM ${BASE}
+COPY release /opt/rust-cache/release
 COPY x86_64-unknown-linux-gnu /opt/rust-cache/x86_64-unknown-linux-gnu
 COPY aarch64-unknown-linux-gnu /opt/rust-cache/aarch64-unknown-linux-gnu
 COPY .cooked /opt/rust-cache/.cooked

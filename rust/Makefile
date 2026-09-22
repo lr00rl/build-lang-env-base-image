@@ -117,38 +117,49 @@ require-local:
 	@docker image inspect $(LOCAL_IMAGE) >/dev/null 2>&1 || { \
 	  echo "need $(LOCAL_IMAGE); run: make rust-build-local"; exit 1; }
 
-# Native rustc, both GNU --target triples, output on the host. rust-base:local
-# already has the registry and cross gcc; the Colima disk only holds that image.
-# Skip when .rlib-out already has both trees from a previous cook.
-cook-rlibs: warmup/Cargo.lock ## compile both GNU rlib trees onto the host
-	@if [ -f "$(RLIB_DIR)/.cooked" ] \
-	    && [ -d "$(RLIB_DIR)/x86_64-unknown-linux-gnu" ] \
-	    && [ -d "$(RLIB_DIR)/aarch64-unknown-linux-gnu" ]; then \
+# amd64-host cargo, both GNU --target triples, output on the host at the
+# same absolute path Jenkins mounts (/cache/target). An arm64 host cook
+# does not match: cargo hashes host build scripts into every rlib.
+# Skip when .hostarch says this tree was already cooked on x86_64.
+DAGENTIC_DIR ?= $(abspath $(CURDIR)/../../../Falcon/dagentic)
+COOK_IMAGE   ?= harbor.openjobs-ai.com/openjobs-ai/rust:1.98-trixie-multiarch
+cook-rlibs: ## compile both GNU rlib trees with an amd64 host onto the host disk
+	@if [ -f "$(RLIB_DIR)/.cooked" ] && [ "$$(cat "$(RLIB_DIR)/.hostarch" 2>/dev/null)" = "x86_64" ]; then \
 	  echo "reuse $(RLIB_DIR)"; \
 	else \
-	  $(MAKE) --no-print-directory require-local; \
+	  rm -rf "$(RLIB_DIR)"; \
 	  mkdir -p "$(RLIB_DIR)"; \
 	  printf '%s\n' \
 	    '*' \
+	    '!release' '!release/**' \
 	    '!x86_64-unknown-linux-gnu' '!x86_64-unknown-linux-gnu/**' \
 	    '!aarch64-unknown-linux-gnu' '!aarch64-unknown-linux-gnu/**' \
-	    '!.cooked' > "$(RLIB_DIR)/.dockerignore"; \
-	  docker run --rm --platform linux/arm64 \
-	    -v "$(CURDIR)/warmup:/opt/rust-warmup:ro" \
-	    -v "$(RLIB_DIR):/work" \
-	    -e CARGO_TARGET_DIR=/work \
+	    '!.cooked' '!.hostarch' > "$(RLIB_DIR)/.dockerignore"; \
+	  docker run --rm --platform linux/amd64 \
+	    -v "$(DAGENTIC_DIR):/src:ro" \
+	    -v "$(RLIB_DIR):/cache/target" \
+	    -e CARGO_TARGET_DIR=/cache/target \
+	    -e CARGO_PROFILE_RELEASE_DEBUG=false \
+	    -e CARGO_INCREMENTAL=0 \
 	    -e CARGO_BUILD_JOBS=$(CARGO_JOBS) \
-	    $(LOCAL_IMAGE) \
+	    -e CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
+	    -e CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++ \
+	    -e CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+	    -e CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+	    -w /src \
+	    $(COOK_IMAGE) \
 	    sh -c 'set -eux; \
-	      cargo build --release --locked --manifest-path /opt/rust-warmup/Cargo.toml --target x86_64-unknown-linux-gnu; \
-	      cargo build --release --locked --manifest-path /opt/rust-warmup/Cargo.toml --target aarch64-unknown-linux-gnu; \
-	      touch /work/.cooked; \
-	      du -sh /work /work/x86_64-unknown-linux-gnu /work/aarch64-unknown-linux-gnu'; \
+	      uname -m; \
+	      cargo build --release --locked -p dagentic --target x86_64-unknown-linux-gnu; \
+	      cargo build --release --locked -p dagentic --target aarch64-unknown-linux-gnu; \
+	      echo x86_64 > /cache/target/.hostarch; \
+	      touch /cache/target/.cooked; \
+	      du -sh /cache/target /cache/target/release /cache/target/x86_64-unknown-linux-gnu /cache/target/aarch64-unknown-linux-gnu'; \
 	fi
 
 push: warmup/Cargo.lock require-registry builder cook-rlibs ## overlay cooked rlibs onto both rust-base platforms and push
 	docker buildx build --builder $(MULTI_BUILDER) --platform $(PLATFORMS) \
-	  --build-arg BASE=$(OVERLAY_BASE) \
+	  --build-arg BASE=$(COOK_IMAGE) \
 	  --provenance=false --sbom=false \
 	  -f rlib-overlay.Dockerfile \
 	  -t $(IMAGE):$(TAG) -t $(IMAGE):$(RUST)-$(SUITE) --push $(RLIB_DIR)

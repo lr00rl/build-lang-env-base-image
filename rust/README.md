@@ -45,19 +45,17 @@ in the 64-bit `time_t` transition, and `apt-get install libssl3` fails on trixie
 
 This is not the application. There is no service `COPY`, no `RUST_LOG`. There is
 a tiny `warmup/` crate whose versions are pinned to dagentic's `Cargo.lock`.
-`cargo fetch --locked` puts that graph in `CARGO_HOME/registry`. A `cook`
-stage then `cargo build --release --target` both GNU triples on
-`$BUILDPLATFORM` (native rustc, cross gcc for the other half) and copies only
-those `target/<triple>` trees into every rust-base platform. Host proc-macros
-stay out: they cannot run on the other Jenkins arch. That is the rust analogue
+`cargo fetch --locked` puts that graph in `CARGO_HOME/registry`. The rlibs
+Jenkins actually reuses are cooked separately, on an amd64 host, with
+`CARGO_TARGET_DIR=/cache/target`: both GNU `--target` triples, plus the
+host `release/` directory of build scripts and proc-macros. Cargo hashes
+those host units into every rlib, so an arm64 cook is stale on Jenkins.
+That tree is copied onto every rust-base platform. It is the rust analogue
 of python-base installing the FastAPI lock: a cold Jenkins agent should not
 wait on crates.io, or LLVM, for the same hundreds of crates every build.
 
-`PRECOMPILE=0` skips the cook (fetch only). Do not run the cook itself under
-QEMU. The Dockerfile pins cook to `$BUILDPLATFORM`, so a Mac multi-arch
-`rust-push` compiles DataFusion once on arm64 and `COPY --from`s the rlibs
-onto the amd64 image. The amd64 half still runs apt and `cargo fetch` under
-QEMU; that is minutes, not hours.
+`PRECOMPILE=0` skips the in-Dockerfile cook (fetch only). Do not LLVM
+DataFusion under QEMU. On this Mac, Rosetta runs the amd64 cook.
 
 `clang` / `libclang-dev` stay out: only bindgen users (rocksdb, rdkafka) need
 them, they cost a few hundred MB, and a service builder stage can `apt-get`
@@ -97,20 +95,17 @@ make rust-push REGISTRY=ghcr.io/your-org VERSION=2026.09.1
 `rust/warmup/Cargo.toml`. Pin top-level versions to the live service's
 `Cargo.lock` (dagentic today) so the fetched graph actually hits.
 
-`make rust-push` cooks both GNU triples on the host (`make cook-rlibs`,
-output in `rust/.rlib-out/`) and overlays those trees onto the existing
-Harbor toolchain for linux/amd64 and linux/arm64. LLVM writes to the Mac
-disk so Colima's 20 GB image store is not asked to hold two triples plus a
-QEMU fetch. Host proc-macros stay out of the overlay; Jenkins rebuilds
-those for amd64 and reuses the target rlibs.
+`make rust-push` cooks both GNU triples on an amd64 host (`make cook-rlibs`,
+output in `rust/.rlib-out/`, `CARGO_TARGET_DIR=/cache/target`) and overlays
+those trees onto the existing Harbor toolchain for linux/amd64 and
+linux/arm64. The cook has to be an amd64 host: cargo hashes host build
+scripts into every rlib, so an arm64 cook is stale on Jenkins. Rosetta is
+fast enough. QEMU is not. LLVM writes to the Mac disk.
 
-The Dockerfile still has a `cook` stage (`PRECOMPILE=0` skips it) for a
-machine with enough image-store disk. On this Mac that path filled the
-volume; do not use it here.
-
-Service Dockerfiles seed a per-arch BuildKit cache from
-`/opt/rust-cache/<triple>` rather than compiling into `/opt/rust-cache`.
-Do not cache-mount `/usr/local/cargo/registry`.
+`release/` in that tree is the host proc-macros and build scripts. Each
+`<triple>/` directory is the rlibs for that `--target`. Service Dockerfiles
+seed both into a BuildKit cache mounted at `/cache/target`. Do not
+cache-mount `/usr/local/cargo/registry`.
 
 To rebuild one platform of the *toolchain* without touching the other:
 
@@ -199,13 +194,17 @@ RUN --mount=type=cache,id=yourapp-cargo-${TARGETARCH},target=/cache/target \
       arm64) triple=aarch64-unknown-linux-gnu ;; \
       *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    if [ -f /opt/rust-cache/.cooked ] && [ -d "/opt/rust-cache/${triple}" ]; then \
+    if [ -f /opt/rust-cache/.cooked ] \
+       && [ -d "/opt/rust-cache/${triple}" ] \
+       && [ -d /opt/rust-cache/release ]; then \
       if [ ! -f /cache/target/.seeded ] \
          || [ ! -d "/cache/target/${triple}" ] \
+         || [ ! -d /cache/target/release ] \
          || [ /opt/rust-cache/.cooked -nt /cache/target/.seeded ]; then \
         mkdir -p /cache/target; \
-        rm -rf "/cache/target/${triple}"; \
+        rm -rf "/cache/target/${triple}" /cache/target/release; \
         cp -a "/opt/rust-cache/${triple}" "/cache/target/${triple}"; \
+        cp -a /opt/rust-cache/release /cache/target/release; \
         touch /cache/target/.seeded; \
       fi; \
     fi; \
