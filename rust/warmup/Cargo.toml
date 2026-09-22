@@ -18,9 +18,9 @@ resolver = "3"
 # and those rlibs would not be reused. Run `make rust-lock` after a dagentic
 # lock bump, then rebuild rust-base.
 #
-# rust-base cargo-builds this package into /opt/rust-cache when PRECOMPILE=auto
-# and the image arch is native, so a service cargo build can reuse the rlibs.
-# Skip that step under QEMU (PRECOMPILE=auto and BUILDARCH != TARGETARCH).
+# rust-base cargo-builds this package for both GNU triples when PRECOMPILE is
+# not 0. That cook runs on BUILDPLATFORM (native rustc, cross linker), then
+# COPY --from puts the same rlib trees on every rust-base platform.
 
 [dependencies]
 anyhow = "=1.0.103"

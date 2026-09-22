@@ -3,7 +3,8 @@
 # Two images out of one file:
 #   --target toolchain -> rust-base     rustc, cargo, clippy, rustfmt, a C
 #                                       toolchain for both GNU linux triples,
-#                                       and a cargo-fetched data-query crate graph
+#                                       cargo-fetched sources, and compiled
+#                                       rlibs for both GNU targets
 #   --target runtime   -> rust-runtime  Debian slim + ca-certificates, no Rust
 #
 # Why two, when python-base is one:
@@ -31,15 +32,15 @@
 #   Debian slim costs about 30 MB over scratch and keeps a shell for incident
 #   work.
 #
-# Do not put --platform=$BUILDPLATFORM on these FROM lines. Each architecture
-# of rust-base has to carry that architecture's rustc. The BUILDPLATFORM pin
-# belongs on the *service* builder stage, so rustc stays native and only the
-# linker (installed below for both GNU triples) targets the other arch.
+# Do not put --platform=$BUILDPLATFORM on the toolchain-apt FROM. Each
+# architecture of rust-base has to carry that architecture's rustc. The pin
+# belongs on the cook stage (native rustc, both GNU triples) and on the
+# *service* builder stage (native rustc, one output triple).
 ARG RUST_VERSION=1.98
 ARG DEBIAN_SUITE=trixie
 
-# --------------------------------------------------------------- toolchain --
-FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS toolchain
+# ---------------------------------------------------------- toolchain-apt --
+FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS toolchain-apt
 
 # The official slim image already carries gcc, libc6-dev and ca-certificates,
 # and installs rustup with --profile minimal, which has no clippy and no
@@ -101,17 +102,10 @@ COPY cargo-config.toml /usr/local/cargo/config.toml
 RUN groupadd --system --gid 10001 app \
  && useradd --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app
 
-# Registry sources plus, when this arch is native, compiled rlibs for both GNU
-# targets. Service images set CARGO_TARGET_DIR here so they reuse those rlibs
-# instead of LLVM-ing DataFusion on every Jenkins job.
-#
-# PRECOMPILE=auto (default) compiles only when BUILDARCH=TARGETARCH. A Mac
-# rust-push then cooks the arm64 image natively (~20-40 min extra) and skips
-# the amd64 image, which would otherwise compile DataFusion under QEMU for
-# hours. Cook the amd64 image on an amd64 node: make rust-push-cooked-amd64.
-ARG BUILDARCH
-ARG TARGETARCH
-ARG PRECOMPILE=auto
+# Registry sources live in this stage (copied into both rust-base platforms).
+# Compiled rlibs are produced in `cook` on the build machine, then copied in,
+# so a Mac `rust-push --platform linux/amd64,linux/arm64` does not LLVM
+# DataFusion under QEMU for the amd64 half.
 ARG CARGO_JOBS=2
 ENV CARGO_TERM_COLOR=always \
     CARGO_INCREMENTAL=0 \
@@ -127,27 +121,44 @@ ENV CARGO_TERM_COLOR=always \
 
 COPY warmup /opt/rust-warmup
 RUN cargo fetch --locked --manifest-path /opt/rust-warmup/Cargo.toml
-# Native triple only. Cooking the other GNU target as well doubled
-# /opt/rust-cache (~5 GB) and a 20 GB Colima disk filled while unpacking
-# the layer. Cross gcc and the other rustup target stay in the image so a
-# BUILDPLATFORM-pinned service can still cross-link; those rlibs land in
-# the service's per-TARGETARCH BuildKit cache after the first job.
-RUN set -eux; \
-    do_compile=0; \
-    if [ "${PRECOMPILE}" = "1" ]; then do_compile=1; \
-    elif [ "${PRECOMPILE}" = "auto" ] && [ "${BUILDARCH}" = "${TARGETARCH}" ]; then do_compile=1; \
-    fi; \
-    if [ "${do_compile}" != 1 ]; then \
-      echo "skip precompile PRECOMPILE=${PRECOMPILE} BUILDARCH=${BUILDARCH} TARGETARCH=${TARGETARCH}"; \
+
+# ------------------------------------------------------------------- cook --
+# BUILDPLATFORM rustc, both GNU --target triples. Host proc-macros stay in
+# the cache mount's `release/` and are not copied: those binaries cannot run
+# on the other Jenkins arch. Service builds recompile proc-macros for the
+# host and reuse the target rlibs.
+FROM --platform=$BUILDPLATFORM toolchain-apt AS cook
+
+ARG PRECOMPILE=auto
+
+RUN --mount=type=cache,id=rust-warmup-target,target=/work/target \
+    set -eux; \
+    mkdir -p /opt/rust-cache; \
+    if [ "${PRECOMPILE}" = "0" ]; then \
+      echo "skip precompile PRECOMPILE=${PRECOMPILE}"; \
       exit 0; \
     fi; \
-    cargo build --release --locked --manifest-path /opt/rust-warmup/Cargo.toml; \
+    export CARGO_TARGET_DIR=/work/target; \
+    cargo build --release --locked --manifest-path /opt/rust-warmup/Cargo.toml \
+      --target x86_64-unknown-linux-gnu; \
+    cargo build --release --locked --manifest-path /opt/rust-warmup/Cargo.toml \
+      --target aarch64-unknown-linux-gnu; \
+    rm -rf /opt/rust-cache/x86_64-unknown-linux-gnu \
+           /opt/rust-cache/aarch64-unknown-linux-gnu; \
+    cp -a /work/target/x86_64-unknown-linux-gnu /opt/rust-cache/; \
+    cp -a /work/target/aarch64-unknown-linux-gnu /opt/rust-cache/; \
     touch /opt/rust-cache/.cooked; \
-    du -sh /opt/rust-cache; \
+    du -sh /opt/rust-cache /opt/rust-cache/x86_64-unknown-linux-gnu \
+          /opt/rust-cache/aarch64-unknown-linux-gnu; \
     echo "rust-base rlibs ready"
 
+# --------------------------------------------------------------- toolchain --
+FROM toolchain-apt AS toolchain
+
+COPY --from=cook /opt/rust-cache /opt/rust-cache
+
 LABEL org.opencontainers.image.title="rust-base" \
-      org.opencontainers.image.description="Rust toolchain (clippy, rustfmt, both GNU linux targets, cross gcc, lld) plus a cargo-fetched and, when native, cargo-built DataFusion/Arrow graph. Build stage only, pair with rust-runtime."
+      org.opencontainers.image.description="Rust toolchain (clippy, rustfmt, both GNU linux targets, cross gcc, lld) plus a cargo-fetched and cargo-built DataFusion/Arrow graph for both GNU triples. Build stage only, pair with rust-runtime."
 
 # Smoke / default. Service builder stages override with cargo build.
 CMD ["cargo", "--version"]

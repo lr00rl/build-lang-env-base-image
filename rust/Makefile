@@ -31,6 +31,10 @@ PLATFORMS     ?= linux/amd64,linux/arm64
 
 PRECOMPILE   ?= auto
 CARGO_JOBS   ?= 2
+# Host-side cargo target dir for cook-rlibs. LLVM writes here so a 20 GB
+# Colima disk is not asked to hold two GNU triples plus a QEMU fetch.
+RLIB_DIR     ?= $(CURDIR)/.rlib-out
+OVERLAY_BASE ?= $(IMAGE):$(RUST)-$(SUITE)
 
 BUILD_ARGS := --build-arg RUST_VERSION=$(RUST) --build-arg DEBIAN_SUITE=$(SUITE) \
 	--build-arg PRECOMPILE=$(PRECOMPILE) --build-arg CARGO_JOBS=$(CARGO_JOBS) \
@@ -47,8 +51,8 @@ BUILD := docker buildx build --builder $(LOCAL_BUILDER) --load $(LOCAL_FLAGS) $(
 .DEFAULT_GOAL := help
 .PHONY: help lock build-local build-local-arm64 build-local-amd64 build-local-multi \
 	smoke smoke-arm64 smoke-amd64 smoke-multi builder push \
-	push-cooked-amd64 push-cooked-arm64 merge-cooked digest \
-	require-registry require-builder
+	cook-rlibs push-cooked-amd64 push-cooked-arm64 merge-cooked digest \
+	require-registry require-builder require-local
 
 help: ## list targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "%-18s %s\n", $$1, $$2}'
@@ -77,8 +81,8 @@ build-local-multi: warmup/Cargo.lock require-builder ## dual-arch index -> :loca
 	$(BUILD) --platform linux/amd64,linux/arm64 --target toolchain -t $(NAME):local-multi .
 	$(BUILD) --platform linux/amd64,linux/arm64 --target runtime   -t $(RT_NAME):local-multi .
 
-smoke: ## print arch, toolchain, both GNU targets, cross gcc, lld, fetched crates
-	docker run --rm $(LOCAL_IMAGE) sh -c 'set -e; uname -m; rustc --version; cargo --version; cargo clippy --version; cargo fmt --version; rustup target list --installed; x86_64-linux-gnu-gcc --version | head -1; aarch64-linux-gnu-gcc --version | head -1; x86_64-linux-gnu-g++ --version | head -1; aarch64-linux-gnu-g++ --version | head -1; ld.lld --version | head -1; python3 --version; test -f /usr/local/cargo/config.toml; test -d /usr/local/cargo/registry/src; test -f /opt/rust-warmup/Cargo.lock; echo CARGO_TARGET_DIR=$$CARGO_TARGET_DIR; ls /opt/rust-cache/.cooked'
+smoke: ## print arch, toolchain, both GNU targets, cross gcc, lld, fetched crates, cooked rlibs
+	docker run --rm $(LOCAL_IMAGE) sh -c 'set -e; uname -m; rustc --version; cargo --version; cargo clippy --version; cargo fmt --version; rustup target list --installed; x86_64-linux-gnu-gcc --version | head -1; aarch64-linux-gnu-gcc --version | head -1; x86_64-linux-gnu-g++ --version | head -1; aarch64-linux-gnu-g++ --version | head -1; ld.lld --version | head -1; python3 --version; test -f /usr/local/cargo/config.toml; test -d /usr/local/cargo/registry/src; test -f /opt/rust-warmup/Cargo.lock; echo CARGO_TARGET_DIR=$$CARGO_TARGET_DIR; test -f /opt/rust-cache/.cooked; test -d /opt/rust-cache/x86_64-unknown-linux-gnu; test -d /opt/rust-cache/aarch64-unknown-linux-gnu; du -sh /opt/rust-cache /opt/rust-cache/x86_64-unknown-linux-gnu /opt/rust-cache/aarch64-unknown-linux-gnu'
 	docker run --rm $(RT_LOCAL) sh -c 'uname -m && . /etc/os-release && echo "$$PRETTY_NAME" && ls -l /etc/ssl/certs/ca-certificates.crt && ldconfig -p | grep -c libgcc_s'
 	docker run --rm --user app $(RT_LOCAL) id
 	docker image ls $(NAME):local
@@ -109,20 +113,52 @@ builder: ## create the multi-arch (docker-container) builder once
 require-registry:
 	@test -n "$(REGISTRY)" || { echo "set REGISTRY, e.g. make push REGISTRY=ghcr.io/your-org"; exit 1; }
 
-push: warmup/Cargo.lock require-registry builder ## multi-arch build + push of both images (requires REGISTRY)
-	docker buildx build --builder $(MULTI_BUILDER) --platform $(PLATFORMS) $(BUILD_ARGS) \
-	  --provenance=mode=max --sbom=true --target toolchain \
-	  -t $(IMAGE):$(TAG) -t $(IMAGE):$(RUST)-$(SUITE) --push .
-	docker buildx build --builder $(MULTI_BUILDER) --platform $(PLATFORMS) $(BUILD_ARGS) \
-	  --provenance=mode=max --sbom=true --target runtime \
-	  -t $(RT_IMAGE):$(RT_TAG) -t $(RT_IMAGE):$(SUITE) --push .
+require-local:
+	@docker image inspect $(LOCAL_IMAGE) >/dev/null 2>&1 || { \
+	  echo "need $(LOCAL_IMAGE); run: make rust-build-local"; exit 1; }
+
+# Native rustc, both GNU --target triples, output on the host. rust-base:local
+# already has the registry and cross gcc; the Colima disk only holds that image.
+# Skip when .rlib-out already has both trees from a previous cook.
+cook-rlibs: warmup/Cargo.lock ## compile both GNU rlib trees onto the host
+	@if [ -f "$(RLIB_DIR)/.cooked" ] \
+	    && [ -d "$(RLIB_DIR)/x86_64-unknown-linux-gnu" ] \
+	    && [ -d "$(RLIB_DIR)/aarch64-unknown-linux-gnu" ]; then \
+	  echo "reuse $(RLIB_DIR)"; \
+	else \
+	  $(MAKE) --no-print-directory require-local; \
+	  mkdir -p "$(RLIB_DIR)"; \
+	  printf '%s\n' \
+	    '*' \
+	    '!x86_64-unknown-linux-gnu' '!x86_64-unknown-linux-gnu/**' \
+	    '!aarch64-unknown-linux-gnu' '!aarch64-unknown-linux-gnu/**' \
+	    '!.cooked' > "$(RLIB_DIR)/.dockerignore"; \
+	  docker run --rm --platform linux/arm64 \
+	    -v "$(CURDIR)/warmup:/opt/rust-warmup:ro" \
+	    -v "$(RLIB_DIR):/work" \
+	    -e CARGO_TARGET_DIR=/work \
+	    -e CARGO_BUILD_JOBS=$(CARGO_JOBS) \
+	    $(LOCAL_IMAGE) \
+	    sh -c 'set -eux; \
+	      cargo build --release --locked --manifest-path /opt/rust-warmup/Cargo.toml --target x86_64-unknown-linux-gnu; \
+	      cargo build --release --locked --manifest-path /opt/rust-warmup/Cargo.toml --target aarch64-unknown-linux-gnu; \
+	      touch /work/.cooked; \
+	      du -sh /work /work/x86_64-unknown-linux-gnu /work/aarch64-unknown-linux-gnu'; \
+	fi
+
+push: warmup/Cargo.lock require-registry builder cook-rlibs ## overlay cooked rlibs onto both rust-base platforms and push
+	docker buildx build --builder $(MULTI_BUILDER) --platform $(PLATFORMS) \
+	  --build-arg BASE=$(OVERLAY_BASE) \
+	  --provenance=false --sbom=false \
+	  -f rlib-overlay.Dockerfile \
+	  -t $(IMAGE):$(TAG) -t $(IMAGE):$(RUST)-$(SUITE) --push $(RLIB_DIR)
 	@$(MAKE) --no-print-directory digest
 
-# Native cook of /opt/rust-cache for both GNU targets. PRECOMPILE=auto on a
-# Mac skips the amd64 half (QEMU would compile DataFusion for hours). Cook
-# each arch on a machine of that arch, then merge:
+# Single-platform rebuilds of the toolchain image. `make push` overlays
+# host-cooked rlib trees onto the Harbor tag; these targets rebuild one
+# platform from the Dockerfile instead:
 #   make rust-push-cooked-arm64 REGISTRY=... NAME=rust
-#   make rust-push-cooked-amd64 REGISTRY=... NAME=rust   # on the Jenkins node
+#   make rust-push-cooked-amd64 REGISTRY=... NAME=rust
 #   make rust-merge-cooked      REGISTRY=... NAME=rust
 push-cooked-amd64: warmup/Cargo.lock require-registry builder ## native amd64 rust-base with precompiled rlibs
 	docker buildx build --builder $(MULTI_BUILDER) --platform linux/amd64 \
