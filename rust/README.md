@@ -215,9 +215,9 @@ RUN --mount=type=cache,id=yourapp-cargo-${TARGETARCH},target=/cache/target \
       cargo build --release --locked -p yourapp; \
       bin=/cache/target/release/yourapp; \
     else \
-      cargo clean --release --locked -p yourapp --target "$${triple}"; \
-      cargo build --release --locked -p yourapp --target "$${triple}"; \
-      bin=/cache/target/$${triple}/release/yourapp; \
+      cargo clean --release --locked -p yourapp --target "${triple}"; \
+      cargo build --release --locked -p yourapp --target "${triple}"; \
+      bin=/cache/target/${triple}/release/yourapp; \
     fi; \
     install -Dm755 "${bin}" /out/yourapp
 
