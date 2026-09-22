@@ -29,7 +29,11 @@ LOCAL_BUILDER ?= $(shell docker buildx ls 2>/dev/null | awk 'NR>1 && $$2=="docke
 MULTI_BUILDER ?= multiarch
 PLATFORMS     ?= linux/amd64,linux/arm64
 
+PRECOMPILE   ?= auto
+CARGO_JOBS   ?= 2
+
 BUILD_ARGS := --build-arg RUST_VERSION=$(RUST) --build-arg DEBIAN_SUITE=$(SUITE) \
+	--build-arg PRECOMPILE=$(PRECOMPILE) --build-arg CARGO_JOBS=$(CARGO_JOBS) \
 	--label org.opencontainers.image.version=$(TAG) \
 	--label org.opencontainers.image.revision=$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown) \
 	--label org.opencontainers.image.created=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -42,14 +46,16 @@ BUILD := docker buildx build --builder $(LOCAL_BUILDER) --load $(LOCAL_FLAGS) $(
 
 .DEFAULT_GOAL := help
 .PHONY: help lock build-local build-local-arm64 build-local-amd64 build-local-multi \
-	smoke smoke-arm64 smoke-amd64 smoke-multi builder push digest require-registry require-builder
+	smoke smoke-arm64 smoke-amd64 smoke-multi builder push \
+	push-cooked-amd64 push-cooked-arm64 merge-cooked digest \
+	require-registry require-builder
 
 help: ## list targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "%-18s %s\n", $$1, $$2}'
 
-lock: warmup/Cargo.lock ## resolve warmup/Cargo.toml -> warmup/Cargo.lock
-warmup/Cargo.lock: warmup/Cargo.toml
-	cd warmup && cargo generate-lockfile
+lock: ## remind how warmup/Cargo.lock is maintained (do not generate-lockfile)
+	@echo "warmup/Cargo.lock is the reachable subset of dagentic Cargo.lock."
+	@echo "cargo generate-lockfile floats transitives and those rlibs miss dagentic."
 
 require-builder:
 	@test -n "$(LOCAL_BUILDER)" || { echo "no docker-driver builder found. run: docker buildx ls"; exit 1; }
@@ -72,7 +78,7 @@ build-local-multi: warmup/Cargo.lock require-builder ## dual-arch index -> :loca
 	$(BUILD) --platform linux/amd64,linux/arm64 --target runtime   -t $(RT_NAME):local-multi .
 
 smoke: ## print arch, toolchain, both GNU targets, cross gcc, lld, fetched crates
-	docker run --rm $(LOCAL_IMAGE) sh -c 'set -e; uname -m; rustc --version; cargo --version; cargo clippy --version; cargo fmt --version; rustup target list --installed; x86_64-linux-gnu-gcc --version | head -1; aarch64-linux-gnu-gcc --version | head -1; x86_64-linux-gnu-g++ --version | head -1; aarch64-linux-gnu-g++ --version | head -1; ld.lld --version | head -1; python3 --version; test -f /usr/local/cargo/config.toml; test -d /usr/local/cargo/registry/src; test -f /opt/rust-warmup/Cargo.lock'
+	docker run --rm $(LOCAL_IMAGE) sh -c 'set -e; uname -m; rustc --version; cargo --version; cargo clippy --version; cargo fmt --version; rustup target list --installed; x86_64-linux-gnu-gcc --version | head -1; aarch64-linux-gnu-gcc --version | head -1; x86_64-linux-gnu-g++ --version | head -1; aarch64-linux-gnu-g++ --version | head -1; ld.lld --version | head -1; python3 --version; test -f /usr/local/cargo/config.toml; test -d /usr/local/cargo/registry/src; test -f /opt/rust-warmup/Cargo.lock; echo CARGO_TARGET_DIR=$$CARGO_TARGET_DIR; ls /opt/rust-cache/.cooked'
 	docker run --rm $(RT_LOCAL) sh -c 'uname -m && . /etc/os-release && echo "$$PRETTY_NAME" && ls -l /etc/ssl/certs/ca-certificates.crt && ldconfig -p | grep -c libgcc_s'
 	docker run --rm --user app $(RT_LOCAL) id
 	docker image ls $(NAME):local
@@ -110,6 +116,33 @@ push: warmup/Cargo.lock require-registry builder ## multi-arch build + push of b
 	docker buildx build --builder $(MULTI_BUILDER) --platform $(PLATFORMS) $(BUILD_ARGS) \
 	  --provenance=mode=max --sbom=true --target runtime \
 	  -t $(RT_IMAGE):$(RT_TAG) -t $(RT_IMAGE):$(SUITE) --push .
+	@$(MAKE) --no-print-directory digest
+
+# Native cook of /opt/rust-cache for both GNU targets. PRECOMPILE=auto on a
+# Mac skips the amd64 half (QEMU would compile DataFusion for hours). Cook
+# each arch on a machine of that arch, then merge:
+#   make rust-push-cooked-arm64 REGISTRY=... NAME=rust
+#   make rust-push-cooked-amd64 REGISTRY=... NAME=rust   # on the Jenkins node
+#   make rust-merge-cooked      REGISTRY=... NAME=rust
+push-cooked-amd64: warmup/Cargo.lock require-registry builder ## native amd64 rust-base with precompiled rlibs
+	docker buildx build --builder $(MULTI_BUILDER) --platform linux/amd64 \
+	  --build-arg RUST_VERSION=$(RUST) --build-arg DEBIAN_SUITE=$(SUITE) \
+	  --build-arg PRECOMPILE=1 --build-arg CARGO_JOBS=$(CARGO_JOBS) \
+	  --provenance=mode=max --sbom=true --target toolchain \
+	  -t $(IMAGE):$(RUST)-$(SUITE)-amd64 --push .
+
+push-cooked-arm64: warmup/Cargo.lock require-registry builder ## native arm64 rust-base with precompiled rlibs
+	docker buildx build --builder $(MULTI_BUILDER) --platform linux/arm64 \
+	  --build-arg RUST_VERSION=$(RUST) --build-arg DEBIAN_SUITE=$(SUITE) \
+	  --build-arg PRECOMPILE=1 --build-arg CARGO_JOBS=$(CARGO_JOBS) \
+	  --provenance=mode=max --sbom=true --target toolchain \
+	  -t $(IMAGE):$(RUST)-$(SUITE)-arm64 --push .
+
+merge-cooked: require-registry ## index from the two cooked single-arch rust-base tags
+	docker buildx imagetools create \
+	  -t $(IMAGE):$(TAG) -t $(IMAGE):$(RUST)-$(SUITE) \
+	  $(IMAGE):$(RUST)-$(SUITE)-amd64 \
+	  $(IMAGE):$(RUST)-$(SUITE)-arm64
 	@$(MAKE) --no-print-directory digest
 
 digest: require-registry ## print tag@sha256 for service Dockerfiles

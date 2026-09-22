@@ -93,20 +93,6 @@ RUN apt-get update \
 RUN rustup component add clippy rustfmt \
  && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 
-# CARGO_INCREMENTAL=0: a container build is one shot and throws the incremental
-# cache away, so producing it only costs disk and link time.
-# The retry counts are for flaky registry DNS inside build agents.
-# CC_*/CXX_*: the cc crate reads these when a build.rs compiles C for the
-# non-host triple. The cargo-config.toml linker= lines cover rustc itself.
-ENV CARGO_TERM_COLOR=always \
-    CARGO_INCREMENTAL=0 \
-    CARGO_NET_RETRY=10 \
-    RUSTUP_MAX_RETRIES=10 \
-    CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
-    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
-    CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++ \
-    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
-
 COPY cargo-config.toml /usr/local/cargo/config.toml
 
 # Same uid as python-base / java-base / node-base. Default user stays root so a
@@ -115,16 +101,53 @@ COPY cargo-config.toml /usr/local/cargo/config.toml
 RUN groupadd --system --gid 10001 app \
  && useradd --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app
 
-# Prefetch the shared data-query crate graph into CARGO_HOME/registry. This is
-# fetch only, not a compile: compiling DataFusion here would make the amd64
-# half of a Mac-hosted rust-push run under QEMU for hours. Service Dockerfiles
-# must not cache-mount /usr/local/cargo/registry, or an empty BuildKit cache
-# hides this layer and Jenkins downloads everything again.
+# Registry sources plus, when this arch is native, compiled rlibs for both GNU
+# targets. Service images set CARGO_TARGET_DIR here so they reuse those rlibs
+# instead of LLVM-ing DataFusion on every Jenkins job.
+#
+# PRECOMPILE=auto (default) compiles only when BUILDARCH=TARGETARCH. A Mac
+# rust-push then cooks the arm64 image natively (~20-40 min extra) and skips
+# the amd64 image, which would otherwise compile DataFusion under QEMU for
+# hours. Cook the amd64 image on an amd64 node: make rust-push-cooked-amd64.
+ARG BUILDARCH
+ARG TARGETARCH
+ARG PRECOMPILE=auto
+ARG CARGO_JOBS=2
+ENV CARGO_TERM_COLOR=always \
+    CARGO_INCREMENTAL=0 \
+    CARGO_NET_RETRY=10 \
+    RUSTUP_MAX_RETRIES=10 \
+    CARGO_BUILD_JOBS=${CARGO_JOBS} \
+    CARGO_PROFILE_RELEASE_DEBUG=false \
+    CARGO_TARGET_DIR=/opt/rust-cache \
+    CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++ \
+    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+
 COPY warmup /opt/rust-warmup
 RUN cargo fetch --locked --manifest-path /opt/rust-warmup/Cargo.toml
+# Native triple only. Cooking the other GNU target as well doubled
+# /opt/rust-cache (~5 GB) and a 20 GB Colima disk filled while unpacking
+# the layer. Cross gcc and the other rustup target stay in the image so a
+# BUILDPLATFORM-pinned service can still cross-link; those rlibs land in
+# the service's per-TARGETARCH BuildKit cache after the first job.
+RUN set -eux; \
+    do_compile=0; \
+    if [ "${PRECOMPILE}" = "1" ]; then do_compile=1; \
+    elif [ "${PRECOMPILE}" = "auto" ] && [ "${BUILDARCH}" = "${TARGETARCH}" ]; then do_compile=1; \
+    fi; \
+    if [ "${do_compile}" != 1 ]; then \
+      echo "skip precompile PRECOMPILE=${PRECOMPILE} BUILDARCH=${BUILDARCH} TARGETARCH=${TARGETARCH}"; \
+      exit 0; \
+    fi; \
+    cargo build --release --locked --manifest-path /opt/rust-warmup/Cargo.toml; \
+    touch /opt/rust-cache/.cooked; \
+    du -sh /opt/rust-cache; \
+    echo "rust-base rlibs ready"
 
 LABEL org.opencontainers.image.title="rust-base" \
-      org.opencontainers.image.description="Rust toolchain (clippy, rustfmt, both GNU linux targets, cross gcc, lld) plus a cargo-fetched DataFusion/Arrow graph. Build stage only, pair with rust-runtime."
+      org.opencontainers.image.description="Rust toolchain (clippy, rustfmt, both GNU linux targets, cross gcc, lld) plus a cargo-fetched and, when native, cargo-built DataFusion/Arrow graph. Build stage only, pair with rust-runtime."
 
 # Smoke / default. Service builder stages override with cargo build.
 CMD ["cargo", "--version"]

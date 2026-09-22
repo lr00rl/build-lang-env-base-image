@@ -5,7 +5,7 @@ first and ships in the second.
 
 | Local tag | Target | Parent | What is inside |
 | --- | --- | --- | --- |
-| `rust-base:local` | `toolchain` | `rust:1.98-slim-trixie` | rustc / cargo 1.98, clippy, rustfmt, gcc, g++, both GNU-linux cross gcc/g++, both rustup GNU targets, lld, pkg-config, cmake, make, git, python3, and a cargo-fetched DataFusion/Arrow graph |
+| `rust-base:local` | `toolchain` | `rust:1.98-slim-trixie` | rustc / cargo 1.98, clippy, rustfmt, gcc, g++, both GNU-linux cross gcc/g++, both rustup GNU targets, lld, pkg-config, cmake, make, git, python3, a cargo-fetched DataFusion/Arrow graph, and when built natively, compiled rlibs under `/opt/rust-cache` |
 | `rust-runtime:local` | `runtime` | `debian:trixie-slim` | ca-certificates, tzdata, uid 10001, `/app` |
 
 Both are built for `linux/amd64` and `linux/arm64`.
@@ -43,17 +43,19 @@ in the 64-bit `time_t` transition, and `apt-get install libssl3` fails on trixie
 
 ## What is in rust-base, and what is not
 
-This is not the application. There is no service `COPY`, no `cargo build` of a
-binary, no `RUST_LOG`. There is a tiny `warmup/` crate whose only job is
-`cargo fetch --locked`, so `CARGO_HOME/registry` already holds the DataFusion /
-Arrow / object_store graph. That is the rust analogue of python-base installing
-the FastAPI lock: a cold Jenkins agent should not wait on crates.io for the
-same hundreds of crates every build.
+This is not the application. There is no service `COPY`, no `RUST_LOG`. There is
+a tiny `warmup/` crate whose versions are pinned to dagentic's `Cargo.lock`.
+`cargo fetch --locked` puts that graph in `CARGO_HOME/registry`. When
+`PRECOMPILE=auto` and the image arch is the build machine, `cargo build
+--release` then writes rlibs for both GNU targets into `/opt/rust-cache`. That
+is the rust analogue of python-base installing the FastAPI lock: a cold Jenkins
+agent should not wait on crates.io, or LLVM, for the same hundreds of crates
+every build.
 
-Do not `cargo build` that warmup in this image. A multi-arch `rust-push` from
-an arm64 laptop would compile DataFusion under QEMU on the amd64 half, which
-is the slowness the service Dockerfile's `--platform=$BUILDPLATFORM` exists
-to avoid. Fetch is architecture-independent and stays fast.
+Do not force `PRECOMPILE=1` on a foreign architecture. A multi-arch `rust-push`
+from an arm64 laptop would compile DataFusion under QEMU on the amd64 half,
+which is the slowness the service Dockerfile's `--platform=$BUILDPLATFORM`
+exists to avoid. `PRECOMPILE=auto` cooks the native half and skips the other.
 
 `clang` / `libclang-dev` stay out: only bindgen users (rocksdb, rdkafka) need
 them, they cost a few hundred MB, and a service builder stage can `apt-get`
@@ -91,6 +93,26 @@ make rust-push REGISTRY=ghcr.io/your-org VERSION=2026.09.1
 `make rust-lock` regenerates `rust/warmup/Cargo.lock` after you edit
 `rust/warmup/Cargo.toml`. Pin top-level versions to the live service's
 `Cargo.lock` (dagentic today) so the fetched graph actually hits.
+
+`PRECOMPILE=auto` (the default) cargo-builds that warmup into
+`/opt/rust-cache` for the native GNU target, but only when the image arch is
+the build machine. Cooking both triples doubled the cache (~5 GB) and filled
+a 20 GB Colima disk while unpacking. The other rustup target stays in the
+image for cross-linking. A Mac `rust-push` cooks arm64 and skips amd64
+(QEMU would take hours). Cook each half natively, then merge:
+
+```bash
+make rust-push-cooked-arm64 REGISTRY=harbor.openjobs-ai.com/openjobs-ai \
+  NAME=rust CARGO_JOBS=2
+make rust-push-cooked-amd64 REGISTRY=harbor.openjobs-ai.com/openjobs-ai \
+  NAME=rust CARGO_JOBS=8
+make rust-merge-cooked REGISTRY=harbor.openjobs-ai.com/openjobs-ai NAME=rust
+```
+
+The amd64 cook has to run on an amd64 node (the Jenkins agent). Service
+Dockerfiles seed a per-arch BuildKit cache from `/opt/rust-cache` rather
+than compiling into that path (copy-on-write would dump gigabytes into a
+layer). Do not cache-mount `/usr/local/cargo/registry`.
 
 Every build target writes both images at once. Single-arch and dual-arch local
 tags work the same as the other languages:
@@ -156,14 +178,19 @@ WORKDIR /src
 ARG CARGO_JOBS=2
 ENV CARGO_BUILD_JOBS=${CARGO_JOBS} \
     CARGO_PROFILE_RELEASE_DEBUG=false
-COPY . .
-# Cache the target dir only. Do not cache-mount /usr/local/cargo/registry:
-# an empty BuildKit cache hides the crates rust-base already fetched, and a
-# cold Jenkins job then downloads the whole graph from crates.io again.
-# The binary is copied to /out inside this RUN because /src/target is gone
-# once the mount ends.
-RUN --mount=type=cache,target=/src/target,sharing=locked \
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src && printf 'fn main() {}\n' > src/main.rs
+# Dummy sources, then real COPY . ., so lockfile-stable rebuilds skip DataFusion.
+# Seed /opt/rust-cache into a per-arch cache; do not compile into /opt/rust-cache
+# (layer bloat) and do not cache-mount the registry (hides the fetch).
+RUN --mount=type=cache,id=yourapp-cargo-${TARGETARCH},target=/cache/target \
     set -eux; \
+    if [ ! -f /cache/target/.seeded ]; then \
+      mkdir -p /cache/target; \
+      if [ -d /opt/rust-cache ]; then cp -a /opt/rust-cache/. /cache/target/; fi; \
+      touch /cache/target/.seeded; \
+    fi; \
+    export CARGO_TARGET_DIR=/cache/target; \
     case "${TARGETARCH}" in \
       amd64) triple=x86_64-unknown-linux-gnu ;; \
       arm64) triple=aarch64-unknown-linux-gnu ;; \
@@ -171,10 +198,26 @@ RUN --mount=type=cache,target=/src/target,sharing=locked \
     esac; \
     if [ "${TARGETARCH}" = "${BUILDARCH}" ]; then \
       cargo build --release --locked -p yourapp; \
-      bin=target/release/yourapp; \
     else \
       cargo build --release --locked -p yourapp --target "${triple}"; \
-      bin=target/${triple}/release/yourapp; \
+    fi
+COPY . .
+RUN --mount=type=cache,id=yourapp-cargo-${TARGETARCH},target=/cache/target \
+    set -eux; \
+    export CARGO_TARGET_DIR=/cache/target; \
+    case "${TARGETARCH}" in \
+      amd64) triple=x86_64-unknown-linux-gnu ;; \
+      arm64) triple=aarch64-unknown-linux-gnu ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    if [ "${TARGETARCH}" = "${BUILDARCH}" ]; then \
+      cargo clean --release --locked -p yourapp; \
+      cargo build --release --locked -p yourapp; \
+      bin=/cache/target/release/yourapp; \
+    else \
+      cargo clean --release --locked -p yourapp --target "$${triple}"; \
+      cargo build --release --locked -p yourapp --target "$${triple}"; \
+      bin=/cache/target/$${triple}/release/yourapp; \
     fi; \
     install -Dm755 "${bin}" /out/yourapp
 

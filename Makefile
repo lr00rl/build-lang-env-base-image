@@ -42,4 +42,9 @@ node-%:
 	@$(MAKE) -C node $(@:node-%=%) REGISTRY="$(REGISTRY)" $(if $(VERSION),VERSION="$(VERSION)")
 
 rust-%:
-	@$(MAKE) -C rust $(@:rust-%=%) REGISTRY="$(REGISTRY)" $(if $(VERSION),VERSION="$(VERSION)")
+	@$(MAKE) -C rust $(@:rust-%=%) REGISTRY="$(REGISTRY)" \
+	  $(if $(VERSION),VERSION="$(VERSION)") \
+	  $(if $(NAME),NAME="$(NAME)") \
+	  $(if $(RT_NAME),RT_NAME="$(RT_NAME)") \
+	  $(if $(PRECOMPILE),PRECOMPILE="$(PRECOMPILE)") \
+	  $(if $(CARGO_JOBS),CARGO_JOBS="$(CARGO_JOBS)")
