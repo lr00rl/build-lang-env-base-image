@@ -6,7 +6,7 @@ Shared **language runtime** images, one directory per language. Each image is a 
 | --- | --- | --- | --- |
 | [`python/`](python/README.md) | `python-base:local` | `python:3.12-slim-trixie` | CPython 3.12, `uv`, hashed FastAPI / SQLAlchemy / aiomysql stack |
 | [`java/`](java/README.md) | `java-base:local` | `eclipse-temurin:17-jdk-jammy` | Temurin 17 JDK on Ubuntu 22.04 |
-| [`node/`](node/README.md) | `node-base:18-alpine` / `20-alpine` / `22-alpine` | official `node:<N>-alpine` | Node 18, 20, and 22 on Alpine, uid 10001 |
+| [`node/`](node/README.md) | `node-base:20-trixie` / `22-trixie` | official `node:<N>-trixie-slim` | Node 20 and 22 on Debian 13 plus `ca-certificates`, uid 10001 (Alpine lines with `DISTRO=alpine`) |
 | [`rust/`](rust/README.md) | `rust-base:local` + `rust-runtime:local` | `rust:1.98-slim-trixie` / `debian:trixie-slim` | Rust 1.98 toolchain with clippy, rustfmt, both GNU-linux targets, cross gcc, lld, and a cargo-fetched DataFusion/Arrow graph, plus the matching runtime half |
 
 Rust is the one language that ships two images. A Rust service compiles against `rust-base` and deploys on `rust-runtime`, which holds no toolchain; see [`rust/README.md`](rust/README.md) for why they have to move together.
@@ -45,6 +45,8 @@ Do not retag a single-arch local image and push it as the dual-arch name. amd64 
 ## Shared conventions
 
 Each image creates a system user `app` with uid/gid **10001**. Default user stays **root** so a child Dockerfile can `chmod` / `mkdir` without flipping `USER`. Child images that want the unprivileged user write `USER app` after those steps.
+
+Every image is Debian or Ubuntu, so a child Dockerfile installs OS packages with `apt-get` on all of them. Put `apt-get update && apt-get install -y --no-install-recommends ... && rm -rf /var/lib/apt/lists/*` before `USER app`; after it, apt fails with a permission error. Alpine is left only as an opt-in node line (`DISTRO=alpine`).
 
 None of these images copies application code, `.env` files, or heap / profile settings. Those belong in the service Dockerfile and in runtime config.
 
